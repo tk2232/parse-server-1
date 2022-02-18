@@ -64,8 +64,7 @@
     "@envelop/depth-limit": "^1.2.3",
     "@envelop/newrelic": "^3.0.0",
     "@envelop/rate-limiter": "^3.0.0",
-    "graphql-helix": "^1.11.0",
-    "newrelic": "^8.7.1"
+    "graphql-helix": "^1.11.0"
   },
   "devDependencies": {
     "@actions/core": "1.2.6",

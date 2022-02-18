@@ -59,7 +59,12 @@
     "uuid": "8.3.2",
     "winston": "3.4.0",
     "winston-daily-rotate-file": "4.5.5",
-    "ws": "8.2.3"
+    "ws": "8.2.3",
+    "@envelop/core": "^2.0.0",
+    "@envelop/depth-limit": "^1.2.3",
+    "@envelop/newrelic": "^3.0.0",
+    "@envelop/rate-limiter": "^3.0.0",
+    "graphql-helix": "^1.11.0"
   },
   "devDependencies": {
     "@actions/core": "1.2.6",

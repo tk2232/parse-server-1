@@ -1,15 +1,18 @@
 import corsMiddleware from 'cors';
 import bodyParser from 'body-parser';
 import { graphqlUploadExpress } from 'graphql-upload';
-import { graphqlExpress } from 'apollo-server-express/dist/expressApollo';
 import { renderPlaygroundPage } from '@apollographql/graphql-playground-html';
-import { execute, subscribe } from 'graphql';
-import { SubscriptionServer } from 'subscriptions-transport-ws';
 import { handleParseErrors, handleParseHeaders } from '../middlewares';
 import requiredParameter from '../requiredParameter';
 import defaultLogger from '../logger';
 import { ParseGraphQLSchema } from './ParseGraphQLSchema';
 import ParseGraphQLController, { ParseGraphQLConfig } from '../Controllers/ParseGraphQLController';
+import { getGraphQLParameters, processRequest } from 'graphql-helix';
+import { envelop, useExtendContext, useMaskedErrors } from '@envelop/core';
+import { useDepthLimit } from '@envelop/depth-limit';
+import { useNewRelic } from '@envelop/newrelic';
+import { execute, subscribe } from 'graphql';
+import { SubscriptionServer } from 'subscriptions-transport-ws';
 
 class ParseGraphQLServer {
   parseGraphQLController: ParseGraphQLController;
@@ -30,25 +33,138 @@ class ParseGraphQLServer {
       graphQLCustomTypeDefs: this.config.graphQLCustomTypeDefs,
       appId: this.parseServer.config.appId,
     });
+    this._getEnveloped = envelop({
+      plugins: [
+        useMaskedErrors(),
+        useDepthLimit({
+          maxDepth: 10,
+          // ignore: [ ... ] - you can set this to ignore specific fields or types
+        }),
+        useExtendContext(context => {
+          return {
+            info: context.request.info,
+            config: context.request.config,
+            auth: context.request.auth,
+          };
+        }),
+        useNewRelic({
+          includeOperationDocument: true, // default `false`. When set to `true`, includes the GraphQL document defining the operations and fragments
+          includeExecuteVariables: false, // default `false`. When set to `true`, includes all the operation variables with their values
+          includeRawResult: false, // default: `false`. When set to `true`, includes the execution result
+          trackResolvers: true, // default `false`. When set to `true`, track resolvers as segments to monitor their performance
+          includeResolverArgs: false, // default `false`. When set to `true`, includes all the arguments passed to resolvers with their values
+          rootFieldsNaming: true, // default `false`. When set to `true` append the names of operation root fields to the transaction name
+          operationNameProperty: 'id', // default empty. When passed will check for the property name passed, within the document object. Will eventually use its value as operation name. Useful for custom document properties (e.g. queryId/hash)
+        }),
+        ...(this.config.envelopPlugins || []),
+      ],
+    });
   }
 
   async _getGraphQLOptions(req) {
-    try {
-      return {
-        schema: await this.parseGraphQLSchema.load(),
-        context: {
+    const schema = await this._getGraphQLSchema();
+    const { contextFactory } = this._getEnveloped();
+    return {
+      schema,
+      context: await contextFactory({
+        request: {
           info: req.info,
           config: req.config,
           auth: req.auth,
         },
-        formatError: error => {
-          // Allow to console.log here to debug
-          return error;
-        },
-      };
+      }),
+    };
+  }
+
+  async _getGraphQLSchema() {
+    try {
+      return await this.parseGraphQLSchema.load();
     } catch (e) {
       this.log.error(e.stack || (typeof e.toString === 'function' && e.toString()) || e);
       throw e;
+    }
+  }
+
+  async _handleGraphQLRequest(req, res) {
+    const request = {
+      body: req.body,
+      headers: req.headers,
+      method: req.method,
+      query: req.query,
+      info: req.info,
+      config: req.config,
+      auth: req.auth,
+    };
+
+    const { execute, subscribe, validate, parse, contextFactory } = this._getEnveloped();
+
+    // Extract the GraphQL parameters from the request
+    const { operationName, query, variables } = getGraphQLParameters(request);
+    const schema = await this._getGraphQLSchema();
+
+    // Validate and execute the query
+    const result = await processRequest({
+      execute,
+      subscribe,
+      validate,
+      parse,
+      operationName,
+      query,
+      variables,
+      request,
+      schema,
+      contextFactory,
+    });
+
+    if (result.type === 'RESPONSE') {
+      // We set the provided status and headers and just the send the payload back to the client
+      result.headers.forEach(({ name, value }) => res.setHeader(name, value));
+      res.status(result.status);
+      res.json(result.payload);
+    } else if (result.type === 'MULTIPART_RESPONSE') {
+      // Defer/Stream over multipart request
+      res.writeHead(200, {
+        Connection: 'keep-alive',
+        'Content-Type': 'multipart/mixed; boundary="-"',
+        'Transfer-Encoding': 'chunked',
+      });
+      req.on('close', () => {
+        result.unsubscribe();
+      });
+
+      res.write('---');
+      await result.subscribe(result => {
+        const chunk = Buffer.from(JSON.stringify(result), 'utf8');
+        const data = [
+          '',
+          'Content-Type: application/json; charset=utf-8',
+          'Content-Length: ' + String(chunk.length),
+          '',
+          chunk,
+        ];
+
+        if (result.hasNext) {
+          data.push('---');
+        }
+
+        res.write(data.join('\r\n'));
+      });
+
+      res.write('\r\n-----\r\n');
+      res.end();
+    } else {
+      // Subscription over SSE
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        Connection: 'keep-alive',
+        'Cache-Control': 'no-cache',
+      });
+      req.on('close', () => {
+        result.unsubscribe();
+      });
+      await result.subscribe(result => {
+        res.write(`data: ${JSON.stringify(result)}\n\n`);
+      });
     }
   }
 
@@ -82,10 +198,7 @@ class ParseGraphQLServer {
     app.use(this.config.graphQLPath, bodyParser.json());
     app.use(this.config.graphQLPath, handleParseHeaders);
     app.use(this.config.graphQLPath, handleParseErrors);
-    app.use(
-      this.config.graphQLPath,
-      graphqlExpress(async req => await this._getGraphQLOptions(req))
-    );
+    app.use(this.config.graphQLPath, this._handleGraphQLRequest.bind(this));
   }
 
   applyPlayground(app) {
